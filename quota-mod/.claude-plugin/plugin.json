@@ -1,1 +1,1 @@
-{ "name": "claudepro-quota", "version": "0.1.0", "description": "/quota: plan limits of the claudepro server's accounts" }
+{ "name": "claudepro-quota", "version": "0.2.0", "description": "/quota, /contribute, and a token and quota line under the prompt", "types": "./types/index.d.ts" }

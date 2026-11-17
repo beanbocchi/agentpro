@@ -1,24 +1,13 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-// quota.json, beside .claude-plugin/, is written by the claudepro installer:
-// { "url": "http://host:8318/quota", "keyFile": "<absolute path of the API key>" }
-type Setup = { url: string; keyFile: string }
+import { readSetup } from './setup'
+import { startPolling, tokens } from './tokens'
 
 // Under claudepro, Claude Code signs in to the proxy with a gateway key. /login
 // would put a personal login in its place, and /logout can revoke the token of
 // an account the proxy shares. Both are hidden from the menu; typed, /login
 // prints the /contribute steps and /logout says there is nothing to log out of.
 const REPLACED = ['login', 'logout']
-
-async function readSetup($: EngineInterface): Promise<{ base: string; key: string } | string> {
-  try {
-    const s: Setup = JSON.parse(await $.fs.read(`${$.plugin.root}/quota.json`))
-    const key = (await $.fs.read(s.keyFile)).trim()
-    return { base: s.url.replace(/\/quota$/, ''), key }
-  } catch (error) {
-    return `cannot read the claudepro setup (${String(error)}); run the claudepro installer again`
-  }
-}
 
 async function post($: EngineInterface, path: string, body: object): Promise<{ error?: string; [k: string]: unknown }> {
   const s = await readSetup($)
@@ -40,6 +29,8 @@ async function post($: EngineInterface, path: string, body: object): Promise<{ e
 }
 
 export const register: Register = on => {
+  tokens(on)
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'quota',
@@ -51,6 +42,7 @@ export const register: Register = on => {
       description: 'Log in to a Claude or ChatGPT account and add it to the claudepro proxy',
       argumentHint: '[claude|codex] | <address the browser landed on>',
     })
+    startPolling($)
     return next(e)
   })
 
