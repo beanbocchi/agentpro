@@ -38,7 +38,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -53,6 +52,12 @@ MGMT_KEY_FILE = os.path.expanduser("~/.config/cliproxyapi-management.key")
 REFRESH_EVERY = 600
 RECENT_BUCKETS = 6  # the proxy counts requests in 10-minute buckets
 LOGINS = os.path.join(BASE, "logins.json")
+# Anthropic's usage endpoint answers HTTP 429 when asked about once a minute per
+# account, so each account is asked at most every USAGE_SECONDS, and after a 429
+# the wait doubles from twice that up to USAGE_MAX_WAIT (or follows Retry-After).
+USAGE_CACHE = os.path.join(BASE, "usage-cache.json")
+USAGE_SECONDS = 300
+USAGE_MAX_WAIT = 3600
 LOGIN_LIFETIME = 28 * 86400
 EXPIRES_SOON = 3 * 86400
 # An access token lives 8 hours, so an account can keep working for that long
@@ -202,6 +207,8 @@ def usage(path, d, kind):
         return FETCHERS[kind](d), None
     except urllib.error.HTTPError as e:
         if e.code != 401:
+            if e.code == 429:
+                _limited[os.path.basename(path)] = retry_after(e.headers)
             return [], ("unavailable", f"usage endpoint answered HTTP {e.code}")
     error = refresh(os.path.basename(path))
     if error:
@@ -213,6 +220,68 @@ def usage(path, d, kind):
 
 
 _last_windows = {}  # auth file name -> (time read, windows) from the last usage call that answered
+_usage_calls = {}  # auth file name -> {"next": when to ask again, "verdict": the last answer's verdict, "strikes": 429s in a row}
+_limited = {}  # auth file name -> Retry-After seconds (0 when absent) of a 429 the last call got
+_usage_loaded = False
+
+
+def retry_after(headers):
+    try:
+        return max(0, int((headers or {}).get("Retry-After") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def ask_usage(path, d, kind, now):
+    """usage(), unless this account was asked less than USAGE_SECONDS ago or is
+    waiting out a 429; then the last answer stands."""
+    name = os.path.basename(path)
+    call = _usage_calls.get(name)
+    if call and now < call["next"]:
+        if call["verdict"] is None and name in _last_windows:
+            return _last_windows[name][1], None
+        if call["verdict"] is not None:
+            return [], call["verdict"]
+    _limited.pop(name, None)
+    try:
+        windows, verdict = usage(path, d, kind)
+    except Exception as e:
+        windows, verdict = [], ("unavailable", type(e).__name__)
+    if name in _limited:
+        strikes = (call or {}).get("strikes", 0) + 1
+        wait = min(USAGE_MAX_WAIT, max(_limited.pop(name), USAGE_SECONDS * 2 ** strikes))
+    else:
+        strikes, wait = 0, USAGE_SECONDS
+    _usage_calls[name] = {"next": now + wait, "verdict": verdict, "strikes": strikes}
+    return windows, verdict
+
+
+def load_usage_cache():
+    """Restores the usage state a restart would otherwise drop, so it does not ask every account at once."""
+    global _usage_loaded
+    if _usage_loaded:
+        return
+    _usage_loaded = True
+    try:
+        with open(USAGE_CACHE) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return
+    for name, (at, windows) in (saved.get("windows") or {}).items():
+        _last_windows.setdefault(name, (at, windows))
+    for name, call in (saved.get("calls") or {}).items():
+        verdict = call.get("verdict")
+        _usage_calls.setdefault(name, dict(call, verdict=tuple(verdict) if verdict else None))
+
+
+def save_usage_cache():
+    tmp = USAGE_CACHE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump({"windows": _last_windows, "calls": _usage_calls}, f)
+        os.replace(tmp, USAGE_CACHE)
+    except OSError:
+        pass
 
 
 def proxy_windows(state):
@@ -338,13 +407,12 @@ def account(path, states, logins, now):
     elif kind not in FETCHERS:
         verdicts.append(("unavailable", "no usage endpoint known for this provider"))
     else:
-        try:
-            entry["windows"], verdict = usage(path, d, kind)
-        except Exception as e:
-            entry["windows"], verdict = [], ("unavailable", type(e).__name__)
+        call = _usage_calls.get(name)
+        entry["windows"], verdict = ask_usage(path, d, kind, now)
         usage_ok = verdict is None
         if usage_ok:
-            _last_windows[name] = (now, entry["windows"])
+            if _usage_calls.get(name) is not call:  # a fresh answer, not the stored one
+                _last_windows[name] = (now, entry["windows"])
         elif verdict[0] == "unavailable":
             # The usage endpoint limits how often it is asked (HTTP 429); the account itself may be fine.
             known = fallback_windows(name, (states or {}).get(name), now)
@@ -378,13 +446,15 @@ def report():
         files = sorted(f for f in glob.glob(os.path.join(AUTH_DIR, "*.json")))
         states = proxy_states()
         now = int(time.time())
+        load_usage_cache()
         with Logins() as logins:
-            with ThreadPoolExecutor(8) as pool:
-                results = list(pool.map(lambda f: account(f, states, logins.data, now), files))
+            # One account after another, so a cold start does not hit the usage endpoint in a burst.
+            results = [account(f, states, logins.data, now) for f in files]
             for f, (_, rec) in zip(files, results):
                 if rec is not None:
                     logins.data[os.path.basename(f)] = rec
             logins.save()
+        save_usage_cache()
         # In the order the proxy uses them: each provider's highest priority first.
         accounts = sorted((entry for entry, _ in results), key=lambda a: (a["provider"], -a.get("priority", 0)))
         data = {"server": SERVER_NAME, "fetched_at": int(time.time()), "proxy_state": states is not None, "accounts": accounts}

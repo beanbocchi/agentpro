@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 spec = importlib.util.spec_from_file_location("quota_server", os.path.join(os.path.dirname(__file__), "quota-server.py"))
@@ -50,6 +51,7 @@ class LoginRecord(unittest.TestCase):
 
 class Account(unittest.TestCase):
     def run_account(self, rec, windows, now=NOW):
+        qs._usage_calls.clear()
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "claude-a@b.c.json")
             with open(path, "w") as f:
@@ -84,6 +86,7 @@ class Fallback(unittest.TestCase):
         qs._last_windows.clear()
 
     def run_account(self, state, windows=None, verdict=None):
+        qs._usage_calls.clear()  # each run asks the endpoint again
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "claude-a@b.c.json")
             with open(path, "w") as f:
@@ -112,6 +115,86 @@ class Fallback(unittest.TestCase):
         entry = self.run_account(self.STATE, verdict=("dead", "log in again"))
         self.assertEqual(entry["windows"], [])
 
+
+
+class Throttle(unittest.TestCase):
+    """How often the usage endpoint is asked."""
+
+    def setUp(self):
+        for d in (qs._last_windows, qs._usage_calls, qs._limited):
+            d.clear()
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, "claude-a@b.c.json")
+        with open(self.path, "w") as f:
+            f.write('{"type": "claude", "email": "a@b.c", "access_token": "x"}')
+        self.asked = 0
+        self.answer = [{"name": "5-hour", "used": 12.0, "resets_at": NOW + 3600}]
+        self.headers = None
+
+    def fetch(self, d):
+        self.asked += 1
+        if self.headers is not None:
+            raise urllib.error.HTTPError("u", 429, "Too Many Requests", self.headers, io.BytesIO())
+        return self.answer
+
+    def run_at(self, now):
+        with mock.patch.dict(qs.FETCHERS, {"claude": self.fetch}), mock.patch.object(qs, "created_at", return_value=NOW):
+            return qs.account(self.path, {"claude-a@b.c.json": {"status": "active"}}, {}, now)[0]
+
+    def test_an_answer_is_reused_for_five_minutes(self):
+        self.run_at(NOW)
+        entry = self.run_at(NOW + qs.USAGE_SECONDS - 1)
+        self.assertEqual((self.asked, entry["windows"], entry["health"]), (1, self.answer, "ok"))
+        self.run_at(NOW + qs.USAGE_SECONDS)
+        self.assertEqual(self.asked, 2)
+
+    def test_a_429_waits_twice_as_long_each_time(self):
+        self.headers = {}
+        self.run_at(NOW)
+        self.run_at(NOW + 2 * qs.USAGE_SECONDS - 1)
+        self.assertEqual(self.asked, 1)
+        self.run_at(NOW + 2 * qs.USAGE_SECONDS)
+        self.assertEqual(self.asked, 2)
+        self.run_at(NOW + 2 * qs.USAGE_SECONDS + 4 * qs.USAGE_SECONDS - 1)
+        self.assertEqual(self.asked, 2)
+
+    def test_the_wait_follows_retry_after_and_stops_at_an_hour(self):
+        self.headers = {"Retry-After": "2000"}
+        self.run_at(NOW)
+        self.run_at(NOW + 1999)
+        self.assertEqual(self.asked, 1)
+        self.headers = {"Retry-After": "99999"}
+        self.run_at(NOW + 2000)
+        self.assertEqual(self.asked, 2)
+        self.assertEqual(qs._usage_calls["claude-a@b.c.json"]["next"], NOW + 2000 + qs.USAGE_MAX_WAIT)
+
+    def test_while_waiting_the_last_figures_stand_in(self):
+        self.run_at(NOW)
+        self.headers = {}
+        entry = self.run_at(NOW + qs.USAGE_SECONDS)
+        entry = self.run_at(NOW + qs.USAGE_SECONDS + 60)
+        self.assertEqual(self.asked, 2)
+        self.assertEqual((entry["windows"], entry["windows_at"], entry["health"]), (self.answer, NOW, "unavailable"))
+
+    def test_a_success_after_429s_resets_the_wait(self):
+        self.headers = {}
+        self.run_at(NOW)
+        self.headers = None
+        self.run_at(NOW + 2 * qs.USAGE_SECONDS)
+        self.assertEqual(qs._usage_calls["claude-a@b.c.json"], {"next": NOW + 3 * qs.USAGE_SECONDS, "verdict": None, "strikes": 0})
+
+    def test_a_restart_keeps_the_state(self):
+        cache = os.path.join(self.dir.name, "usage-cache.json")
+        with mock.patch.object(qs, "USAGE_CACHE", cache):
+            self.run_at(NOW)
+            qs.save_usage_cache()
+            for d in (qs._last_windows, qs._usage_calls):
+                d.clear()
+            with mock.patch.object(qs, "_usage_loaded", False):
+                qs.load_usage_cache()
+        entry = self.run_at(NOW + 60)
+        self.assertEqual((self.asked, entry["windows"], entry["health"]), (1, self.answer, "ok"))
 
 class Text(unittest.TestCase):
     def render(self, **account):
@@ -144,7 +227,9 @@ class Order(unittest.TestCase):
                 with open(os.path.join(d, name), "w") as f:
                     json.dump({"type": name.split("-")[0], "email": name[:-5], "priority": prio}, f)
             qs._cache.update(at=0.0, data=None)
+            qs._usage_calls.clear()
             with mock.patch.object(qs, "AUTH_DIR", d), mock.patch.object(qs, "LOGINS", os.path.join(d, "logins.json")), \
+                    mock.patch.object(qs, "USAGE_CACHE", os.path.join(d, "usage-cache.json")), mock.patch.object(qs, "_usage_loaded", True), \
                     mock.patch.object(qs, "proxy_states", return_value=None), mock.patch.object(qs, "usage", return_value=([], None)):
                 data = qs.report()
             qs._cache.update(at=0.0, data=None)
