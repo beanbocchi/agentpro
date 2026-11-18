@@ -2,6 +2,7 @@
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -89,6 +90,24 @@ class Text(unittest.TestCase):
         self.assertNotIn("login ", self.render(login_expires_at=NOW + DAY, login_expires_exact=False, health="dead", detail="log in again"))
 
 
+    def test_priority_is_shown_when_set(self):
+        self.assertIn("[ok]  prio -10", self.render(priority=-10))
+        self.assertNotIn("prio", self.render(priority=0))
+
+
+class Order(unittest.TestCase):
+    def test_accounts_follow_the_proxy_priority_within_each_provider(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name, prio in (("claude-a.json", -10), ("claude-b.json", 0), ("claude-c.json", 30), ("codex-d.json", 0), ("claude-e.json", 30)):
+                with open(os.path.join(d, name), "w") as f:
+                    json.dump({"type": name.split("-")[0], "email": name[:-5], "priority": prio}, f)
+            qs._cache.update(at=0.0, data=None)
+            with mock.patch.object(qs, "AUTH_DIR", d), mock.patch.object(qs, "LOGINS", os.path.join(d, "logins.json")), \
+                    mock.patch.object(qs, "proxy_states", return_value=None), mock.patch.object(qs, "usage", return_value=([], None)):
+                data = qs.report()
+            qs._cache.update(at=0.0, data=None)
+        self.assertEqual([a["email"] for a in data["accounts"]], ["claude-c", "claude-e", "claude-b", "claude-a", "codex-d"])
+
 class LoggedIn(unittest.TestCase):
     def test_records_exact_expiry(self):
         with tempfile.TemporaryDirectory() as d:
@@ -122,7 +141,7 @@ class Contribute(unittest.TestCase):
         if path == "/oauth-callback":
             # The proxy writes the account's auth file once it has the tokens.
             with open(os.path.join(self.dir.name, "claude-new@x.y.json"), "w") as f:
-                f.write('{"type": "claude", "email": "new@x.y"}')
+                f.write('{"type": "claude", "email": "new@x.y", "refresh_token": "fresh"}')
             return 200, {"status": "ok"}
         if path.startswith("/get-auth-status"):
             return 200, {"status": "ok"}
@@ -138,6 +157,33 @@ class Contribute(unittest.TestCase):
         with qs.Logins() as logins:
             self.assertEqual(logins.data["claude-new@x.y.json"], {"expires_at": NOW + qs.LOGIN_LIFETIME, "exact": True, "dead": False})
         self.assertEqual(qs._pending, {})
+
+    def write(self, name, **fields):
+        with open(os.path.join(self.dir.name, name), "w") as f:
+            json.dump({"type": "claude", **fields}, f)
+
+    def test_other_accounts_changed_during_the_window_are_not_logins(self):
+        self.write("claude-old@x.y.json", email="old@x.y", refresh_token="r1")
+        self.write("claude-edited@x.y.json", email="edited@x.y", refresh_token="e1")
+        with mock.patch.object(qs, "mgmt", self.fake_mgmt), mock.patch.object(qs.time, "time", return_value=NOW):
+            qs.contribute_start("claude")
+            # Between start and finish the proxy refreshes one account and
+            # someone sets another's priority.
+            self.write("claude-old@x.y.json", email="old@x.y", refresh_token="r2")
+            self.write("claude-edited@x.y.json", email="edited@x.y", refresh_token="e1", priority=-10)
+            code, out = qs.contribute_finish("http://localhost:54545/callback?code=abc&state=st1")
+        self.assertEqual(out["accounts"], ["new@x.y"])
+        with qs.Logins() as logins:
+            self.assertEqual(sorted(logins.data), ["claude-new@x.y.json"])
+
+    def test_logging_in_again_to_a_known_account_is_recorded(self):
+        self.write("claude-new@x.y.json", email="new@x.y", refresh_token="old")
+        with mock.patch.object(qs, "mgmt", self.fake_mgmt), mock.patch.object(qs.time, "time", return_value=NOW):
+            qs.contribute_start("claude")
+            code, out = qs.contribute_finish("http://localhost:54545/callback?code=abc&state=st1")
+        self.assertEqual(out["accounts"], ["new@x.y"])
+        with qs.Logins() as logins:
+            self.assertEqual(logins.data["claude-new@x.y.json"]["expires_at"], NOW + qs.LOGIN_LIFETIME)
 
     def test_finish_refuses_a_state_it_did_not_issue(self):
         with mock.patch.object(qs, "mgmt", self.fake_mgmt):

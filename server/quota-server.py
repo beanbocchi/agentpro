@@ -26,6 +26,7 @@ Without a record the expiry is estimated as the auth file's creation time plus
 """
 import fcntl
 import glob
+import hashlib
 import json
 import os
 import socket
@@ -279,15 +280,23 @@ def proxy_verdict(state):
 SEVERITY = ["dead", "disabled", "not loaded", "unavailable", "refresh failed", "expires soon", "limit reached", "cooling down", "failing", "ok"]
 
 
+def priority(auth):
+    """The auth file's routing priority: the proxy picks higher values first, default 0."""
+    try:
+        return int(auth.get("priority") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def account(path, states, logins, now):
     """One account's report entry, plus its new LOGINS record (None for non-Claude accounts)."""
     name = os.path.basename(path)
     try:
         d = read_auth(path)
     except (OSError, ValueError):
-        return {"provider": "?", "email": name, "plan": None, "windows": [], "health": "unavailable", "detail": "unreadable auth file"}, None
+        return {"provider": "?", "email": name, "plan": None, "priority": 0, "windows": [], "health": "unavailable", "detail": "unreadable auth file"}, None
     kind = d.get("type", "?")
-    entry = {"provider": kind, "email": d.get("email", name), "plan": d.get("plan_type"), "windows": []}
+    entry = {"provider": kind, "email": d.get("email", name), "plan": d.get("plan_type"), "priority": priority(d), "windows": []}
     verdicts, usage_ok = [], False
     if d.get("disabled"):
         verdicts.append(("disabled", None))
@@ -333,7 +342,8 @@ def report():
                 if rec is not None:
                     logins.data[os.path.basename(f)] = rec
             logins.save()
-        accounts = [entry for entry, _ in results]
+        # In the order the proxy uses them: each provider's highest priority first.
+        accounts = sorted((entry for entry, _ in results), key=lambda a: (a["provider"], -a.get("priority", 0)))
         data = {"server": SERVER_NAME, "fetched_at": int(time.time()), "proxy_state": states is not None, "accounts": accounts}
         _cache.update(at=time.time(), data=data)
         return _cache["data"]
@@ -364,7 +374,8 @@ def as_text(data):
     for a in data["accounts"]:
         plan = f" ({a['plan']})" if a.get("plan") else ""
         health = a["health"].upper() if a["health"] in ("dead", "disabled", "not loaded") else a["health"]
-        lines.append(f"{a['provider'].capitalize():<7} {short_email(a['email'])}{plan}  [{health}]")
+        prio = f"  prio {a['priority']}" if a.get("priority") else ""
+        lines.append(f"{a['provider'].capitalize():<7} {short_email(a['email'])}{plan}  [{health}]{prio}")
         if a["detail"] and a["health"] != "limit reached":  # the full bar already says which window
             lines.append(f"  {a['detail']}")
         for w in a["windows"]:
@@ -385,12 +396,20 @@ def as_text(data):
 AUTH_URL = {"claude": "/anthropic-auth-url?is_webui=true", "codex": "/codex-auth-url?is_webui=true"}
 CALLBACK_PROVIDER = {"claude": "anthropic", "codex": "codex"}
 PENDING_SECONDS = 900
-_pending = {}  # OAuth state -> {"provider", "at", "files"}
+_pending = {}  # OAuth state -> {"provider", "at"}
 
 
-def auth_files():
-    """Each auth file's name and modification time."""
-    return {os.path.basename(f): os.stat(f).st_mtime for f in glob.glob(os.path.join(AUTH_DIR, "*.json"))}
+def auth_tokens():
+    """Each auth file's name and a hash of its refresh token. A login writes a new
+    token; a metadata edit (priority, disabled) keeps it."""
+    out = {}
+    for f in glob.glob(os.path.join(AUTH_DIR, "*.json")):
+        try:
+            token = read_auth(f).get("refresh_token") or ""
+        except (OSError, ValueError):
+            continue
+        out[os.path.basename(f)] = hashlib.sha256(token.encode()).hexdigest()
+    return out
 
 
 def contribute_start(provider):
@@ -402,7 +421,7 @@ def contribute_start(provider):
     now = time.time()
     for state in [s for s, p in _pending.items() if now - p["at"] > PENDING_SECONDS]:
         del _pending[state]
-    _pending[body["state"]] = {"provider": provider, "at": now, "files": auth_files()}
+    _pending[body["state"]] = {"provider": provider, "at": now}
     return 200, {"provider": provider, "url": body["url"], "state": body["state"]}
 
 
@@ -412,6 +431,9 @@ def contribute_finish(redirect_url, wait=60):
     pending = _pending.get(state)
     if not pending or not (query.get("code") or [""])[0]:
         return 400, {"error": "paste the whole address the browser landed on (it holds code= and state=), from a login started with /contribute in the last 15 minutes"}
+    # Taken just before the exchange, so a refresh or edit earlier in the
+    # 15-minute window does not read as this login.
+    before = auth_tokens()
     code, body = mgmt("POST", "/oauth-callback", {"provider": CALLBACK_PROVIDER[pending["provider"]], "redirect_url": redirect_url.strip(), "state": state})
     if code != 200 or body.get("status") == "error":
         return 502, {"error": body.get("error") or f"the proxy answered HTTP {code}"}
@@ -427,8 +449,7 @@ def contribute_finish(redirect_url, wait=60):
         _pending.pop(state, None)
         return 502, {"error": status.get("error") or "the login failed"}
     del _pending[state]
-    before = pending["files"]
-    changed = [n for n, t in auth_files().items() if before.get(n) != t]
+    changed = [n for n, t in auth_tokens().items() if before.get(n) != t]
     accounts = []
     for name in changed:
         try:
