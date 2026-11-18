@@ -149,5 +149,25 @@ class Contribute(unittest.TestCase):
         self.assertEqual(qs.contribute_start("gemini")[0], 400)
 
 
+
+class ClientKeys(unittest.TestCase):
+    def test_quotes_and_trailing_comments_are_dropped(self):
+        config = (
+            "access:\n"
+            "  api-keys:\n"
+            "    - sk-plain\n"
+            "    - 'sk-single'\n"
+            "    - \"sk-quoted\" # someone, added 2026-11-18\n"
+            "    - sk-bare # a comment\n"
+            "# next section\n"
+            "    - sk-not-a-key\n"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(config)
+        self.addCleanup(os.unlink, f.name)
+        with mock.patch.object(qs, "CONFIG", f.name):
+            self.assertEqual(qs.client_keys(), {"sk-plain", "sk-single", "sk-quoted", "sk-bare"})
+
+
 if __name__ == "__main__":
     unittest.main()

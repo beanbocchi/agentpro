@@ -76,7 +76,12 @@ def client_keys():
                 continue
             if inside:
                 if line.startswith("    - "):
-                    keys.add(line[6:].strip().strip("\"'"))
+                    value = line[6:].strip()
+                    if value and value[0] in "\"'" and value[0] in value[1:]:
+                        value = value[1 : value.index(value[0], 1)]
+                    else:
+                        value = value.split(" #", 1)[0].strip()
+                    keys.add(value)
                 else:
                     break
     return keys
