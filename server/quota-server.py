@@ -29,6 +29,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -211,6 +212,40 @@ def usage(path, d, kind):
         return [], ("dead", "token rejected after a refresh") if e.code == 401 else ("unavailable", f"HTTP {e.code}")
 
 
+_last_windows = {}  # auth file name -> (time read, windows) from the last usage call that answered
+
+
+def proxy_windows(state):
+    """Claude windows from the rate-limit headers the proxy kept off its latest request, with their time."""
+    best = None
+    for q in ((state or {}).get("model_quotas") or {}).values():
+        try:
+            at = datetime.fromisoformat(re.sub(r"(\.\d{6})\d+", r"\1", q["observed_at"])).timestamp()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if best is None or at > best[0]:
+            best = (at, q.get("signals") or {})
+    if best is None:
+        return None
+    at, sig = best
+    windows = []
+    for key, label in (("5h", "5-hour"), ("7d", "weekly")):
+        used = sig.get(f"Anthropic-Ratelimit-Unified-{key}-Utilization")
+        if used is not None:
+            reset = sig.get(f"Anthropic-Ratelimit-Unified-{key}-Reset")
+            windows.append({"name": label, "used": round(float(used) * 100, 1), "resets_at": int(reset) if reset else None})
+    return (at, windows) if windows else None
+
+
+def fallback_windows(name, state, now):
+    """The newest windows known for an account whose usage call failed, a passed reset read as 0%, and their time."""
+    known = [w for w in (_last_windows.get(name), proxy_windows(state)) if w]
+    if not known:
+        return None
+    at, windows = max(known, key=lambda w: w[0])
+    return at, [dict(w, used=0.0) if w["resets_at"] and w["resets_at"] <= now else w for w in windows]
+
+
 def created_at(path):
     """The file's creation time (statx birth time), or its mtime when the filesystem has none."""
     try:
@@ -308,6 +343,14 @@ def account(path, states, logins, now):
         except Exception as e:
             entry["windows"], verdict = [], ("unavailable", type(e).__name__)
         usage_ok = verdict is None
+        if usage_ok:
+            _last_windows[name] = (now, entry["windows"])
+        elif verdict[0] == "unavailable":
+            # The usage endpoint limits how often it is asked (HTTP 429); the account itself may be fine.
+            known = fallback_windows(name, (states or {}).get(name), now)
+            if known:
+                entry["windows"], entry["windows_at"] = known[1], int(known[0])
+                verdict = (verdict[0], f"{verdict[1]}; figures from {until(now, int(known[0]))} ago")
         if verdict:
             verdicts.append(verdict)
     if states is not None:

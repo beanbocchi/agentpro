@@ -9,6 +9,8 @@ const QUOTA = {
     { provider: 'claude', health: 'ok', windows: [{ name: '5-hour', used: 20 }, { name: 'weekly', used: 90 }] },
     { provider: 'claude', health: 'ok', windows: [{ name: '5-hour', used: 50 }, { name: 'weekly', used: 10 }] },
     { provider: 'claude', health: 'dead', windows: [] },
+    { provider: 'claude', health: 'unavailable', windows: [] },
+    { provider: 'claude', health: 'unavailable', windows: [{ name: '5-hour', used: 75 }] },
     { provider: 'codex', health: 'limit reached', windows: [{ name: '5-hour', used: 100 }, { name: 'weekly', used: 40 }] },
   ],
 }
@@ -16,9 +18,10 @@ const QUOTA = {
 const ZERO = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, requests: 0 }
 
 test('each live account counts what its tightest window has left', () => {
-  // 0.10 (weekly is tighter) + 0.50 (5-hour is tighter); the dead account counts for nothing.
+  // 0.10 (weekly is tighter) + 0.50 (5-hour is tighter) + 0.25 (unavailable, with the
+  // server's last figures). The dead account and the one with no figures count for nothing.
   expect(sumPools(QUOTA.accounts)).toEqual([
-    { provider: 'claude', live: 2, left: 0.6 },
+    { provider: 'claude', live: 3, left: 0.85 },
     { provider: 'codex', live: 1, left: 0 },
   ])
 })
@@ -48,6 +51,6 @@ test('the hint line under the prompt carries the figures', async ($, on) => {
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await new Promise(r => setTimeout(r, 50))
   const ui = await $.ui.mount({ plugin: 'claudepro-quota', component: 'PromptHint', surface: 'terminal', props: { isDraft: false, isWorking: false, hint: '? for shortcuts' } })
-  expect(tail).toBe('0 tok · today 0 │ claude ▰▰▱▱▱▱ 0.6/2 │ codex ▱▱▱▱▱▱ 0.0/1')
+  expect(tail).toBe('0 tok · today 0 │ claude ▰▰▱▱▱▱ 0.8/3 │ codex ▱▱▱▱▱▱ 0.0/1')
   await ui.unmount()
 })

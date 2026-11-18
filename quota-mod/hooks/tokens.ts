@@ -16,7 +16,7 @@ type Window = { name: string; used: number }
 type Account = { provider: string; health: string; windows: Window[] }
 type Usage = { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }
 
-const GONE = new Set(['dead', 'disabled', 'unavailable'])
+const GONE = new Set(['dead', 'disabled'])
 
 let lastPoll = 0
 
@@ -40,7 +40,8 @@ function total(t: Tokens): number {
   return t.input + t.output + t.cacheRead + t.cacheWrite
 }
 
-// An account that is dead, disabled or reports no windows counts for nothing.
+// An account that is dead, disabled or has no windows counts for nothing. An
+// unavailable one counts with the windows the server last knew for it.
 // A live one counts what its tightest window has left: the 5-hour, the weekly,
 // or a model's own weekly limit.
 export function sumPools(accounts: Account[]): Pool[] {

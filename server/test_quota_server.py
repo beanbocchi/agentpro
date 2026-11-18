@@ -71,6 +71,48 @@ class Account(unittest.TestCase):
         self.assertEqual((entry["health"], entry["login_expires_at"], entry["login_expires_exact"]), ("ok", NOW + 28 * DAY, False))
 
 
+class Fallback(unittest.TestCase):
+    STATE = {"status": "active", "model_quotas": {
+        "claude-haiku-5-5": {"observed_at": "2026-11-17T20:43:26.199492126+07:00", "signals": {
+            "Anthropic-Ratelimit-Unified-5h-Utilization": "0.10", "Anthropic-Ratelimit-Unified-7d-Utilization": "0.30"}},
+        "claude-opus-5-5": {"observed_at": "2026-11-17T21:17:01.72859683+07:00", "signals": {
+            "Anthropic-Ratelimit-Unified-5h-Utilization": "0.37", "Anthropic-Ratelimit-Unified-5h-Reset": str(NOW + 3600),
+            "Anthropic-Ratelimit-Unified-7d-Utilization": "0.87", "Anthropic-Ratelimit-Unified-7d-Reset": str(NOW - 60)}},
+    }}
+
+    def setUp(self):
+        qs._last_windows.clear()
+
+    def run_account(self, state, windows=None, verdict=None):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "claude-a@b.c.json")
+            with open(path, "w") as f:
+                f.write('{"type": "claude", "email": "a@b.c", "access_token": "x"}')
+            ret = (windows or [], verdict)
+            with mock.patch.object(qs, "usage", return_value=ret), mock.patch.object(qs, "created_at", return_value=NOW):
+                return qs.account(path, {"claude-a@b.c.json": state}, {}, NOW)[0]
+
+    def test_proxy_headers_stand_in_when_the_usage_endpoint_says_429(self):
+        entry = self.run_account(self.STATE, verdict=("unavailable", "usage endpoint answered HTTP 429"))
+        # The newest observation wins, and the weekly window has reset since then.
+        self.assertEqual(entry["windows"], [
+            {"name": "5-hour", "used": 37.0, "resets_at": NOW + 3600},
+            {"name": "weekly", "used": 0.0, "resets_at": NOW - 60},
+        ])
+        self.assertEqual(entry["health"], "unavailable")
+        self.assertTrue(entry["detail"].startswith("usage endpoint answered HTTP 429; figures from "))
+
+    def test_the_last_good_answer_stands_in_when_newer(self):
+        good = [{"name": "5-hour", "used": 21.0, "resets_at": NOW + 99}]
+        self.run_account({"status": "active"}, windows=good)
+        entry = self.run_account(self.STATE, verdict=("unavailable", "usage endpoint answered HTTP 429"))
+        self.assertEqual((entry["windows"], entry["windows_at"]), (good, NOW))
+
+    def test_a_dead_account_gets_no_stand_in(self):
+        entry = self.run_account(self.STATE, verdict=("dead", "log in again"))
+        self.assertEqual(entry["windows"], [])
+
+
 class Text(unittest.TestCase):
     def render(self, **account):
         base = {"provider": "claude", "email": "a@b.c", "plan": None, "windows": [], "health": "ok", "detail": None}
